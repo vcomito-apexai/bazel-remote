@@ -10,6 +10,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -36,6 +38,8 @@ var resourceExhaustedResponse = asset.FetchBlobResponse{
 }
 
 const remoteAssetAPILogPrefix = "[REMOTE_ASSET_API]"
+
+var netrcPathFunc = netrcPath
 
 func (s *grpcServer) remoteAssetInfof(format string, args ...any) {
 	s.accessLogger.Printf(remoteAssetAPILogPrefix+" "+format, args...)
@@ -239,6 +243,7 @@ func (s *grpcServer) fetchItem(ctx context.Context, uri string, headers http.Hea
 	}
 
 	req.Header = headers
+	s.applyNetrcCredentials(req)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -284,6 +289,152 @@ func (s *grpcServer) fetchItem(ctx context.Context, uri string, headers http.Hea
 	}
 
 	return expectedHash, expectedSize, nil
+}
+
+type netrcCredentials struct {
+	login    string
+	password string
+}
+
+func (s *grpcServer) applyNetrcCredentials(req *http.Request) {
+	if req.URL == nil {
+		return
+	}
+
+	if req.Header.Get("Authorization") != "" {
+		s.remoteAssetInfof("skipping .netrc credentials because Authorization header is already set: host=%s", req.URL.Host)
+		return
+	}
+
+	if req.URL.User != nil {
+		s.remoteAssetInfof("skipping .netrc credentials because URI already contains user info: host=%s", req.URL.Host)
+		return
+	}
+
+	creds, source, err := lookupNetrcCredentials(req.URL.Hostname())
+	if err != nil {
+		s.remoteAssetErrorf("failed to read .netrc credentials for host=%s: %v", req.URL.Hostname(), err)
+		return
+	}
+	if creds == nil {
+		s.remoteAssetInfof("no .netrc credentials found for host=%s", req.URL.Hostname())
+		return
+	}
+
+	req.SetBasicAuth(creds.login, creds.password)
+	s.remoteAssetInfof("using .netrc credentials for host=%s from %s", req.URL.Hostname(), source)
+}
+
+func lookupNetrcCredentials(host string) (*netrcCredentials, string, error) {
+	path, err := netrcPathFunc()
+	if err != nil {
+		return nil, "", err
+	}
+	if path == "" {
+		return nil, "", nil
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, "", nil
+		}
+		return nil, "", err
+	}
+
+	tokens := strings.Fields(string(data))
+	if len(tokens) == 0 {
+		return nil, "", nil
+	}
+
+	var (
+		matchedCreds *netrcCredentials
+		defaultCreds *netrcCredentials
+		currentHost  string
+		currentCreds *netrcCredentials
+	)
+
+	commitEntry := func() {
+		if currentCreds == nil || currentCreds.login == "" || currentCreds.password == "" {
+			currentHost = ""
+			currentCreds = nil
+			return
+		}
+
+		if currentHost == "default" {
+			creds := *currentCreds
+			defaultCreds = &creds
+		} else if currentHost == host {
+			creds := *currentCreds
+			matchedCreds = &creds
+		}
+
+		currentHost = ""
+		currentCreds = nil
+	}
+
+	for i := 0; i < len(tokens); i++ {
+		switch tokens[i] {
+		case "machine", "default":
+			commitEntry()
+
+			if tokens[i] == "default" {
+				currentHost = "default"
+				currentCreds = &netrcCredentials{}
+				continue
+			}
+
+			if i+1 >= len(tokens) {
+				return nil, "", fmt.Errorf("malformed .netrc: missing machine name")
+			}
+			i++
+			currentHost = tokens[i]
+			currentCreds = &netrcCredentials{}
+		case "login":
+			if currentCreds == nil || i+1 >= len(tokens) {
+				continue
+			}
+			i++
+			currentCreds.login = tokens[i]
+		case "password":
+			if currentCreds == nil || i+1 >= len(tokens) {
+				continue
+			}
+			i++
+			currentCreds.password = tokens[i]
+		case "account", "macdef":
+			if i+1 < len(tokens) {
+				i++
+			}
+		}
+	}
+	commitEntry()
+
+	if matchedCreds != nil {
+		return matchedCreds, path, nil
+	}
+
+	if defaultCreds == nil || defaultCreds.login == "" || defaultCreds.password == "" {
+		return nil, "", nil
+	}
+
+	return defaultCreds, path, nil
+}
+
+func netrcPath() (string, error) {
+	if path := os.Getenv("NETRC"); path != "" {
+		return path, nil
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	if home == "" {
+		return "", nil
+	}
+
+	return filepath.Join(home, ".netrc"), nil
 }
 
 func (s *grpcServer) FetchDirectory(context.Context, *asset.FetchDirectoryRequest) (*asset.FetchDirectoryResponse, error) {
