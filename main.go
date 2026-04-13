@@ -46,8 +46,21 @@ var gitCommit string
 // commit joined by commas.
 var gitTags string
 
+func currentVersion() string {
+	if len(gitTags) > 0 && gitTags != "{GIT_TAGS}" {
+		return gitTags
+	}
+
+	if len(gitCommit) > 0 && gitCommit != "{STABLE_GIT_COMMIT}" {
+		return gitCommit
+	}
+
+	return "development"
+}
+
 func main() {
 	app := cli.NewApp()
+	app.Version = currentVersion()
 
 	cli.AppHelpTemplate = flags.Template
 	cli.HelpPrinterCustom = flags.HelpPrinter
