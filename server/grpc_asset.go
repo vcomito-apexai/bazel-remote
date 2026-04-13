@@ -35,6 +35,16 @@ var resourceExhaustedResponse = asset.FetchBlobResponse{
 	},
 }
 
+const remoteAssetAPILogPrefix = "[REMOTE_ASSET_API]"
+
+func (s *grpcServer) remoteAssetInfof(format string, args ...any) {
+	s.accessLogger.Printf(remoteAssetAPILogPrefix+" "+format, args...)
+}
+
+func (s *grpcServer) remoteAssetErrorf(format string, args ...any) {
+	s.errorLogger.Printf(remoteAssetAPILogPrefix+" "+format, args...)
+}
+
 func (s *grpcServer) FetchBlob(ctx context.Context, req *asset.FetchBlobRequest) (*asset.FetchBlobResponse, error) {
 
 	var sha256Str string
@@ -65,6 +75,8 @@ func (s *grpcServer) FetchBlob(ctx context.Context, req *asset.FetchBlobRequest)
 		return nil, errNilFetchBlobRequest
 	}
 
+	s.remoteAssetInfof("FetchBlob request received: uris=%d qualifiers=%d", len(req.GetUris()), len(req.GetQualifiers()))
+
 	globalHeader := http.Header{}
 
 	uriSpecificHeaders := make(map[int]http.Header)
@@ -91,18 +103,18 @@ func (s *grpcServer) FetchBlob(ctx context.Context, req *asset.FetchBlobRequest)
 			idxAndKey := q.Name[len(QualifierHTTPHeaderUrlPrefix):]
 			parts := strings.Split(idxAndKey, ":")
 			if len(parts) != 2 {
-				s.errorLogger.Printf("invalid http_header_url qualifier: \"%s\"", idxAndKey)
+				s.remoteAssetErrorf("invalid http_header_url qualifier: %q", idxAndKey)
 				continue
 			}
 
 			uriIndex, err := strconv.Atoi(parts[0])
 			if err != nil {
-				s.errorLogger.Printf("failed to parse URI index as int: %s", err)
+				s.remoteAssetErrorf("failed to parse URI index as int: %v", err)
 				continue
 			}
 
 			if uriIndex < 0 || uriIndex >= len(req.GetUris()) {
-				s.errorLogger.Printf("URI index for header is out of range [0 - %d]: %d", len(req.GetUris())-1, uriIndex)
+				s.remoteAssetErrorf("URI index for header is out of range [0 - %d]: %d", len(req.GetUris())-1, uriIndex)
 				continue
 			}
 
@@ -121,31 +133,36 @@ func (s *grpcServer) FetchBlob(ctx context.Context, req *asset.FetchBlobRequest)
 
 			decoded, err := base64.StdEncoding.DecodeString(b64hash)
 			if err != nil {
-				s.errorLogger.Printf("failed to base64 decode \"%s\": %v",
+				s.remoteAssetErrorf("failed to base64 decode %q: %v",
 					b64hash, err)
 				continue
 			}
 
 			sha256Str = hex.EncodeToString(decoded)
+			s.remoteAssetInfof("repository asset checksum resolved: sha256=%s", sha256Str)
 
 			found, size := s.cache.Contains(ctx, cache.CAS, sha256Str, -1)
 			if !found {
+				s.remoteAssetInfof("repository asset not found in cache: sha256=%s", sha256Str)
 				continue
 			}
 
 			if size < 0 {
+				s.remoteAssetInfof("repository asset found in cache, resolving size from backend: sha256=%s", sha256Str)
 				// We don't know the size yet (bad http backend?).
 				r, actualSize, err := s.cache.Get(ctx, cache.CAS, sha256Str, -1, 0)
 				if r != nil {
 					defer func() { _ = r.Close() }()
 				}
 				if err != nil || actualSize < 0 {
-					s.errorLogger.Printf("failed to get CAS %s from proxy backend size: %d err: %v",
+					s.remoteAssetErrorf("failed to get CAS %s from proxy backend size: %d err: %v",
 						sha256Str, actualSize, err)
 					continue
 				}
 				size = actualSize
 			}
+
+			s.remoteAssetInfof("repository asset found in cache: sha256=%s size=%d", sha256Str, size)
 
 			return &asset.FetchBlobResponse{
 				Status: &status.Status{Code: int32(codes.OK)},
@@ -158,10 +175,14 @@ func (s *grpcServer) FetchBlob(ctx context.Context, req *asset.FetchBlobRequest)
 	}
 
 	// Cache miss.
+	if sha256Str == "" {
+		s.remoteAssetInfof("repository asset cache lookup skipped: no sha256 checksum qualifier provided")
+	}
 
 	// See if we can download one of the URIs.
 
 	for uriIndex, uri := range req.GetUris() {
+		s.remoteAssetInfof("attempting repository asset fetch from URI: %s", uri)
 		uriSpecificHeader := globalHeader.Clone()
 		if header, found := uriSpecificHeaders[uriIndex]; found {
 			for key, value := range header {
@@ -171,6 +192,7 @@ func (s *grpcServer) FetchBlob(ctx context.Context, req *asset.FetchBlobRequest)
 
 		actualHash, size, err := s.fetchItem(ctx, uri, uriSpecificHeader, sha256Str)
 		if err == nil {
+			s.remoteAssetInfof("repository asset fetched and stored in cache: uri=%s sha256=%s size=%d", uri, actualHash, size)
 			return &asset.FetchBlobResponse{
 				Status: &status.Status{Code: int32(codes.OK)},
 				BlobDigest: &pb.Digest{
@@ -182,11 +204,16 @@ func (s *grpcServer) FetchBlob(ctx context.Context, req *asset.FetchBlobRequest)
 		}
 
 		if translateGRPCErrCodeFromClient(err) == codes.ResourceExhausted {
+			s.remoteAssetErrorf("repository asset fetch hit resource exhaustion: uri=%s err=%v", uri, err)
 			return &resourceExhaustedResponse, nil
 		}
 
+		s.remoteAssetInfof("repository asset fetch from URI failed: uri=%s err=%v", uri, err)
+
 		// Not a simple file. Not yet handled...
 	}
+
+	s.remoteAssetInfof("repository asset not found after checking cache and %d URI(s)", len(req.GetUris()))
 
 	return &asset.FetchBlobResponse{
 		Status: &status.Status{Code: int32(codes.NotFound)},
@@ -196,18 +223,18 @@ func (s *grpcServer) FetchBlob(ctx context.Context, req *asset.FetchBlobRequest)
 func (s *grpcServer) fetchItem(ctx context.Context, uri string, headers http.Header, expectedHash string) (string, int64, error) {
 	u, err := url.Parse(uri)
 	if err != nil {
-		s.errorLogger.Printf("unable to parse URI: %s err: %v", uri, err)
+		s.remoteAssetErrorf("unable to parse URI %s: %v", uri, err)
 		return "", int64(-1), err
 	}
 
 	if u.Scheme != "http" && u.Scheme != "https" {
-		s.errorLogger.Printf("unsupported URI: %s", uri)
+		s.remoteAssetErrorf("unsupported URI: %s", uri)
 		return "", int64(-1), fmt.Errorf("unknown URL scheme: %q", u.Scheme)
 	}
 
 	req, err := http.NewRequest(http.MethodGet, uri, nil)
 	if err != nil {
-		s.errorLogger.Printf("failed to create http.Request: %s err: %v", uri, err)
+		s.remoteAssetErrorf("failed to create http.Request for %s: %v", uri, err)
 		return "", int64(-1), err
 	}
 
@@ -215,13 +242,13 @@ func (s *grpcServer) fetchItem(ctx context.Context, uri string, headers http.Hea
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		s.errorLogger.Printf("failed to get URI: %s err: %v", uri, err)
+		s.remoteAssetErrorf("failed to GET URI %s: %v", uri, err)
 		return "", int64(-1), err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	rc := resp.Body
 
-	s.accessLogger.Printf("GRPC ASSET FETCH %s %s", uri, resp.Status)
+	s.remoteAssetInfof("repository asset HTTP fetch response: uri=%s status=%s", uri, resp.Status)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "", int64(-1), fmt.Errorf("unsuccessful HTTP status code: %d", resp.StatusCode)
 	}
@@ -232,7 +259,7 @@ func (s *grpcServer) fetchItem(ctx context.Context, uri string, headers http.Hea
 
 		data, err := io.ReadAll(resp.Body)
 		if err != nil {
-			s.errorLogger.Printf("failed to read data: %v", uri)
+			s.remoteAssetErrorf("failed to read data from %s: %v", uri, err)
 			return "", int64(-1), err
 		}
 
@@ -241,7 +268,7 @@ func (s *grpcServer) fetchItem(ctx context.Context, uri string, headers http.Hea
 		hashStr := hex.EncodeToString(hashBytes[:])
 
 		if expectedHash != "" && hashStr != expectedHash {
-			s.errorLogger.Printf("URI data has hash %s, expected %s",
+			s.remoteAssetErrorf("URI data has hash %s, expected %s",
 				hashStr, expectedHash)
 			return "", int64(-1), fmt.Errorf("URI data has hash %s, expected %s", hashStr, expectedHash)
 		}
@@ -252,7 +279,7 @@ func (s *grpcServer) fetchItem(ctx context.Context, uri string, headers http.Hea
 
 	err = s.cache.Put(ctx, cache.CAS, expectedHash, expectedSize, rc)
 	if err != nil && err != io.EOF {
-		s.errorLogger.Printf("failed to Put %s: %v", expectedHash, err)
+		s.remoteAssetErrorf("failed to store %s in cache: %v", expectedHash, err)
 		return "", int64(-1), err
 	}
 
