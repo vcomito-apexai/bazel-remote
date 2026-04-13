@@ -1,0 +1,81 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            target: //:bazel-remote-linux-amd64
+            output: bazel-bin/bazel-remote-linux-amd64_/bazel-remote-linux-amd64
+            binary: bazel-remote-linux-amd64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            target: //:bazel-remote-linux-arm64
+            output: bazel-bin/bazel-remote-linux-arm64_/bazel-remote-linux-arm64
+            binary: bazel-remote-linux-arm64
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Bazelisk
+        uses: bazelbuild/setup-bazelisk@v3
+
+      - name: Build release binary
+        run: bazel build "${{ matrix.target }}"
+
+      - name: Stage release asset
+        run: |
+          install -D "${{ matrix.output }}" "dist/${{ matrix.binary }}"
+
+      - name: Upload release asset
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.binary }}
+          path: dist/${{ matrix.binary }}
+          if-no-files-found: error
+
+  release:
+    name: publish-release
+    runs-on: ubuntu-24.04
+    needs: build
+
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bazel-remote-linux-*
+          merge-multiple: true
+          path: release-assets
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" \
+              release-assets/bazel-remote-linux-amd64 \
+              release-assets/bazel-remote-linux-arm64 \
+              --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" \
+              release-assets/bazel-remote-linux-amd64 \
+              release-assets/bazel-remote-linux-arm64 \
+              --generate-notes \
+              --title "${GITHUB_REF_NAME}"
+          fi
